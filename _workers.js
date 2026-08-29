@@ -1,60 +1,73 @@
-// ============================================================
-// scw-singbox Cloudflare Worker — 加固版 + 保活代理
-// ============================================================
-// 新增功能：
-//   1. WebSocket 自动重连（容器断连后自动恢复）
-//   2. 冷启动等待（容器 404/503 时自动重试）
-//   3. 客户端断连检测（避免无效重连）
-//   4. 连接健康检查（保持长连接活跃）
+// scw-singbox Cloudflare Worker — 加固版
+// 配合 scw-singbox 项目使用：VLESS+WS 反代 + 多页面伪装站
+// 新增：共享密钥闸门（防未授权激活容器）、Private 容器鉴权头、env 校验、robots/favicon
 //
-// 环境变量：
-//   WS_PATH, ORIGIN_DOMAIN, CONTAINER_TOKEN, WS_SECRET（原有）
-//   新增可选：
-//   CONTAINER_RETRY_DELAY  — 重试延迟（毫秒，默认 1000）
-//   CONTAINER_MAX_RETRIES  — 最大重试次数（默认 5）
-//   KEEPALIVE_INTERVAL     — 保活间隔（秒，默认 30）
-// ============================================================
+// 需要在 Worker Settings → Variables 中配置：
+//   WS_PATH         — WebSocket 路径，必须与 Scaleway 容器的 WS_PATH 完全一致
+//   ORIGIN_DOMAIN   — Scaleway 容器分配的域名（如 xxx.functions.fnc.fr-par.scw.cloud）
+//   CONTAINER_TOKEN — Scaleway Private 容器的 IAM API Key secret（X-Auth-Token），用于鉴权放行
+//   WS_SECRET       — 共享密钥，客户端 WS 请求需带 X-Proxy-Token 头且值与此一致才放行
+// 建议 ORIGIN_DOMAIN / CONTAINER_TOKEN / WS_SECRET 均设为 Secret（加密存储）。
 
 const TOKEN_HEADER = 'X-Proxy-Token';
 
 export default {
     async fetch(request, env) {
-        // ---- 0. 环境变量校验 ----
+        // ---- 0. 环境变量校验：缺失直接 503，避免反代到 undefined ----
         if (!env.WS_PATH || !env.ORIGIN_DOMAIN || !env.CONTAINER_TOKEN || !env.WS_SECRET) {
             return new Response('service unavailable', { status: 503 });
         }
 
-        const url = new URL(request.url);
-        const token = request.headers.get(TOKEN_HEADER) || url.searchParams.get('token');
+        let url = new URL(request.url);
 
         // ============================================================
-        // 1. WebSocket 代理（带保活/重连逻辑）
+        // 1. 核心代理逻辑：仅转发带共享密钥的合法 WebSocket 升级请求
         // ============================================================
         if (url.pathname === env.WS_PATH) {
-            // 1a. 鉴权（支持 Header + Query Parameter）
-            if (token !== env.WS_SECRET) {
+            // 1a. 共享密钥闸门：无凭据的请求一律返回伪装页，不转发到容器
+            //     → 阻止爬虫/主动探测命中 WS 路径导致容器冷启动（成本 & 隐蔽）
+            if (request.headers.get(TOKEN_HEADER) !== env.WS_SECRET) {
                 return new Response(PAGES.fileAccess, {
                     headers: { 'Content-Type': 'text/html;charset=UTF-8' }
                 });
             }
 
-            // 1b. 校验 WebSocket 升级请求
+            // 1b. 校验是否为完整的 WebSocket 升级请求
             const upgradeHeader = request.headers.get('Upgrade');
             const connectionHeader = request.headers.get('Connection');
             const wsKey = request.headers.get('Sec-WebSocket-Key');
             if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket'
                 || !wsKey || !connectionHeader || !connectionHeader.toLowerCase().includes('upgrade')) {
+                // 普通 GET 命中 WS 路径（已带密钥但非 WS）→ 返回与下载上下文一致的页面
                 return new Response(PAGES.fileAccess, {
                     headers: { 'Content-Type': 'text/html;charset=UTF-8' }
                 });
             }
 
-            // 1c. 使用 WebSocketPair 建立双向代理
-            return handleWebSocketProxy(request, env);
+            // 1c. 合法 WS 升级 → 反代到 Scaleway Private 容器
+            url.protocol = 'https:';
+            url.hostname = env.ORIGIN_DOMAIN;
+
+            let newHeaders = new Headers(request.headers);
+            newHeaders.set('Host', env.ORIGIN_DOMAIN);            // 覆写 Host，过 Scaleway 网关
+            newHeaders.set('X-Auth-Token', env.CONTAINER_TOKEN);   // Private 容器鉴权
+            // 共享密钥头不必透传到容器，删除以减少信息泄露
+            newHeaders.delete(TOKEN_HEADER);
+
+            let new_request = new Request(url, {
+                method: request.method,
+                headers: newHeaders,
+                body: request.body,
+                redirect: request.redirect
+            });
+
+            // 直接返回 fetch 响应，不包装
+            // WebSocket 升级响应必须原样返回，不能用 new Response() 包装，否则握手失败
+            return fetch(new_request);
         }
 
         // ============================================================
-        // 2. 伪装站点（完全保留原有内容）
+        // 2. 站点辅助文件：robots.txt / favicon，让站点更像真实网站
         // ============================================================
         if (url.pathname === '/robots.txt') {
             return new Response(
@@ -63,9 +76,13 @@ export default {
             );
         }
         if (url.pathname === '/favicon.ico') {
+            // 返回 204，避免对每个 favicon 请求返回大段 HTML 404
             return new Response(null, { status: 204 });
         }
 
+        // ============================================================
+        // 3. 多页面伪装站路由
+        // ============================================================
         switch (url.pathname) {
             case '/':
                 return html(PAGES.home);
@@ -83,268 +100,6 @@ export default {
     }
 };
 
-// ============================================================
-// 核心：WebSocket 保活代理
-// ============================================================
-async function handleWebSocketProxy(request, env) {
-    // 获取配置（带默认值）
-    const retryDelay = parseInt(env.CONTAINER_RETRY_DELAY) || 1000;
-    const maxRetries = parseInt(env.CONTAINER_MAX_RETRIES) || 5;
-    const keepaliveInterval = parseInt(env.KEEPALIVE_INTERVAL) || 30;
-
-    // 创建 WebSocketPair
-    const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair);
-
-    // 状态管理
-    let isClientClosed = false;
-    let isContainerConnected = false;
-    let containerWs = null;
-    let keepaliveTimer = null;
-    let reconnectAttempts = 0;
-
-    // ============================================================
-    // 1. 连接到容器的函数（带重试）
-    // ============================================================
-    async function connectToContainer() {
-        const containerUrl = new URL(`https://${env.ORIGIN_DOMAIN}${env.WS_PATH}`);
-        
-        // 生成 WebSocket Key
-        const wsKey = generateWebSocketKey();
-        
-        const headers = {
-            'Host': env.ORIGIN_DOMAIN,
-            'X-Auth-Token': env.CONTAINER_TOKEN,
-            'Upgrade': 'websocket',
-            'Connection': 'Upgrade',
-            'Sec-WebSocket-Key': wsKey,
-            'Sec-WebSocket-Version': '13'
-        };
-
-        try {
-            const response = await fetch(containerUrl.toString(), {
-                method: 'GET',
-                headers: headers,
-                redirect: 'manual'
-            });
-
-            // 101 = WebSocket 升级成功
-            if (response.status === 101 && response.webSocket) {
-                return response.webSocket;
-            }
-            
-            // 容器冷启动中（Scaleway 容器未就绪）
-            if (response.status === 404 || response.status === 503) {
-                return null;
-            }
-            
-            // 其他错误
-            console.error(`容器返回异常状态: ${response.status}`);
-            return null;
-        } catch (e) {
-            console.error('连接容器失败:', e.message);
-            return null;
-        }
-    }
-
-    // ============================================================
-    // 2. 建立容器连接（带重试循环）
-    // ============================================================
-    async function establishContainerConnection() {
-        while (reconnectAttempts < maxRetries) {
-            const ws = await connectToContainer();
-            
-            if (ws) {
-                containerWs = ws;
-                isContainerConnected = true;
-                reconnectAttempts = 0;
-                setupContainerListeners(ws);
-                return true;
-            }
-            
-            reconnectAttempts++;
-            if (reconnectAttempts < maxRetries) {
-                const delay = retryDelay * reconnectAttempts;
-                console.log(`容器未就绪，${delay}ms 后重试 (${reconnectAttempts}/${maxRetries})`);
-                await sleep(delay);
-            }
-        }
-        
-        console.error(`容器连接失败，已重试 ${maxRetries} 次`);
-        return false;
-    }
-
-    // ============================================================
-    // 3. 设置容器 WebSocket 监听器
-    // ============================================================
-    function setupContainerListeners(ws) {
-        ws.accept();
-
-        // 收到容器消息 → 转发给客户端
-        ws.addEventListener('message', (event) => {
-            if (!isClientClosed && client.readyState === 1) {
-                try {
-                    client.send(event.data);
-                } catch (e) {
-                    console.error('转发消息到客户端失败:', e);
-                }
-            }
-        });
-
-        // 容器断开 → 触发重连
-        ws.addEventListener('close', (event) => {
-            console.log(`容器断开: code=${event.code}, reason=${event.reason || '未知'}`);
-            isContainerConnected = false;
-            containerWs = null;
-            
-            // 清理保活定时器
-            if (keepaliveTimer) {
-                clearInterval(keepaliveTimer);
-                keepaliveTimer = null;
-            }
-            
-            // 如果客户端还在，尝试重连
-            if (!isClientClosed) {
-                console.log('尝试重连容器...');
-                reconnectToContainer();
-            }
-        });
-
-        ws.addEventListener('error', (event) => {
-            console.error('容器 WebSocket 错误:', event);
-            // 关闭连接，触发重连
-            if (ws.readyState === 1) {
-                ws.close(1000, 'Error occurred');
-            }
-        });
-
-        // 保活定时器（发送 Ping 帧保持连接）
-        keepaliveTimer = setInterval(() => {
-            if (ws.readyState === 1) {
-                try {
-                    ws.send('ping');  // 简单的 Ping 消息
-                } catch (e) {
-                    console.error('保活 Ping 发送失败:', e);
-                }
-            }
-        }, keepaliveInterval * 1000);
-    }
-
-    // ============================================================
-    // 4. 重连逻辑
-    // ============================================================
-    async function reconnectToContainer() {
-        // 清理旧连接
-        if (containerWs) {
-            try {
-                containerWs.close(1000, 'Reconnecting');
-            } catch (e) {}
-            containerWs = null;
-        }
-        
-        isContainerConnected = false;
-        reconnectAttempts = 0;
-        
-        const success = await establishContainerConnection();
-        if (!success && !isClientClosed) {
-            // 连接失败，继续重试（由 establishContainerConnection 内的循环处理）
-            console.log('重连失败，将自动重试');
-        }
-    }
-
-    // ============================================================
-    // 5. 处理客户端消息
-    // ============================================================
-    client.accept();
-
-    client.addEventListener('message', (event) => {
-        // 转发客户端消息到容器
-        if (isContainerConnected && containerWs && containerWs.readyState === 1) {
-            try {
-                containerWs.send(event.data);
-            } catch (e) {
-                console.error('转发消息到容器失败:', e);
-                // 容器可能已断开，触发重连
-                if (isContainerConnected) {
-                    isContainerConnected = false;
-                    reconnectToContainer();
-                }
-            }
-        } else {
-            // 容器未连接，缓存消息？(简化处理：丢弃)
-            console.warn('容器未连接，丢弃客户端消息');
-        }
-    });
-
-    client.addEventListener('close', (event) => {
-        console.log(`客户端断开: code=${event.code}`);
-        isClientClosed = true;
-        
-        // 清理资源
-        if (keepaliveTimer) {
-            clearInterval(keepaliveTimer);
-            keepaliveTimer = null;
-        }
-        
-        if (containerWs && containerWs.readyState === 1) {
-            containerWs.close(1000, 'Client disconnected');
-        }
-        containerWs = null;
-    });
-
-    client.addEventListener('error', (event) => {
-        console.error('客户端 WebSocket 错误:', event);
-        // 客户端错误可能意味着连接已失效
-        if (client.readyState !== 1) {
-            isClientClosed = true;
-            if (containerWs && containerWs.readyState === 1) {
-                containerWs.close(1000, 'Client error');
-            }
-        }
-    });
-
-    // ============================================================
-    // 6. 启动连接
-    // ============================================================
-    const connected = await establishContainerConnection();
-    if (!connected) {
-        // 连接失败，发送错误消息给客户端
-        try {
-            client.close(1011, 'Container connection failed');
-        } catch (e) {}
-        return new Response('Container unavailable', { status: 503 });
-    }
-
-    // 返回客户端 WebSocket 连接
-    return new Response(null, {
-        status: 101,
-        webSocket: client,
-        headers: {
-            'Upgrade': 'websocket',
-            'Connection': 'Upgrade',
-            'Sec-WebSocket-Accept': await generateAccept(request.headers.get('Sec-WebSocket-Key'))
-        }
-    });
-}
-
-// ============================================================
-// 工具函数
-// ============================================================
-function generateWebSocketKey() {
-    const key = crypto.randomBytes(16).toString('base64');
-    return key;
-}
-
-async function generateAccept(key) {
-    const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
-    const hash = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(key + GUID));
-    return btoa(String.fromCharCode(...new Uint8Array(hash)));
-}
-
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
-
 function html(body, status = 200) {
     return new Response(body, {
         status,
@@ -353,8 +108,10 @@ function html(body, status = 200) {
 }
 
 // ============================================================
-// 伪装页面（完全保留原有内容）
+// 伪装页面模板 — 软件下载站主题
+// 站名：OpenSoft Hub，与代理/容器/基础设施厂商无关
 // ============================================================
+
 const PAGES = {
     home: `<!DOCTYPE html>
 <html lang="en">
@@ -440,6 +197,7 @@ const PAGES = {
     <footer>&copy; 2026 OpenSoft Hub. All trademarks belong to their respective owners.</footer>
 </body>
 </html>`,
+
     about: `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -483,6 +241,7 @@ const PAGES = {
     <footer>&copy; 2026 OpenSoft Hub. All trademarks belong to their respective owners.</footer>
 </body>
 </html>`,
+
     downloads: `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -575,6 +334,7 @@ const PAGES = {
     <footer>&copy; 2026 OpenSoft Hub. All trademarks belong to their respective owners.</footer>
 </body>
 </html>`,
+
     docs: `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -624,7 +384,9 @@ const PAGES = {
         <p><a href="/">&larr; Back to home</a></p>
     </div>
     <footer>&copy; 2026 OpenSoft Hub. All trademarks belong to their respective owners.</footer>
+</body>
 </html>`,
+
     contact: `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -666,7 +428,9 @@ const PAGES = {
         <p><a href="/">&larr; Back to home</a></p>
     </div>
     <footer>&copy; 2026 OpenSoft Hub. All trademarks belong to their respective owners.</footer>
+</body>
 </html>`,
+
     fileAccess: `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -709,6 +473,7 @@ const PAGES = {
     <footer>&copy; 2026 OpenSoft Hub. All trademarks belong to their respective owners.</footer>
 </body>
 </html>`,
+
     notFound: `<!DOCTYPE html>
 <html lang="en">
 <head>
