@@ -1,0 +1,68 @@
+{
+  "log": {
+    "level": "@LOG_LEVEL@",
+    "timestamp": false
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "udp",
+        "tag": "resolver",
+        "server": "1.1.1.1"
+      }
+    ],
+    "strategy": "ipv4_only"
+  },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-ws-in",
+      "listen": "0.0.0.0",
+      "listen_port": @PORT@,
+      "sniff": false,
+      "users": [
+        {
+          "uuid": "@UUID@",
+          "flow": ""
+        }
+      ],
+      "transport": {
+        "type": "ws",
+        "path": "@WS_PATH@",
+        "max_early_data": 2048,
+        "early_data_header_name": "Sec-WebSocket-Protocol"
+      },
+      "multiplex": {
+        "enabled": true,
+        "padding": false
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct",
+      "domain_resolver": {
+        "server": "resolver",
+        "strategy": "ipv4_only"
+      }
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "ip_is_private": true,
+        "outbound": "block"
+      }
+    ],
+    "final": "direct",
+    "default_domain_resolver": {
+      "server": "resolver",
+      "strategy": "ipv4_only"
+    }
+  }
+}
