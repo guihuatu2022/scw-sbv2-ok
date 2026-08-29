@@ -1,0 +1,30 @@
+{
+  "type": "vless",
+  "tag": "scw-singbox",
+  "server": "你的worker域名.workers.dev 或 自定义域名",
+  "server_port": 443,
+  "uuid": "你的UUID（与服务端 UUID 一致）",
+  "flow": "",
+  "transport": {
+    "type": "ws",
+    "path": "/db/你的高熵路径.iso（与服务端 WS_PATH 完全一致）",
+    "headers": {
+      "X-Proxy-Token": "你的WS_SECRET（与 Worker 变量 WS_SECRET 一致）"
+    },
+    "max_early_data": 2048,
+    "early_data_header_name": "Sec-WebSocket-Protocol"
+  },
+  "tls": {
+    "enabled": true,
+    "server_name": "你的worker域名或自定义域名",
+    "insecure": false,
+    "utls": {
+      "enabled": true,
+      "fingerprint": "chrome"
+    }
+  },
+  "multiplex": {
+    "enabled": true,
+    "padding": false
+  }
+}
