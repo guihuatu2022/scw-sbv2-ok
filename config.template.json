@@ -1,7 +1,8 @@
 {
   "log": {
     "level": "@LOG_LEVEL@",
-    "timestamp": false
+    "timestamp": false,
+    "disable_color": true
   },
   "dns": {
     "servers": [
@@ -29,7 +30,7 @@
       "transport": {
         "type": "ws",
         "path": "@WS_PATH@",
-        "max_early_data": 2048,
+        "max_early_data": 1024,
         "early_data_header_name": "Sec-WebSocket-Protocol"
       },
       "multiplex": {
