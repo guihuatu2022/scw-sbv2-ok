@@ -26,6 +26,5 @@
   "multiplex": {
     "enabled": true,
     "padding": false,
-    "protocol": "h2mux"
   }
 }
