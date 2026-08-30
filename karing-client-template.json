@@ -25,6 +25,7 @@
   },
   "multiplex": {
     "enabled": true,
-    "padding": false
+    "padding": false,
+    "protocol": "h2mux"
   }
 }
